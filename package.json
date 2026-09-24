@@ -1,0 +1,18 @@
+{
+  "name": "ttfl-admin",
+  "private": true,
+  "version": "0.1.0",
+  "type": "module",
+  "scripts": {
+    "dev:web": "pnpm --filter web dev",
+    "dev:api": "pnpm --filter api dev",
+    "build:web": "pnpm --filter web build",
+    "typecheck": "pnpm -r typecheck",
+    "db:init:local": "pnpm --filter api db:init:local",
+    "db:init:remote": "pnpm --filter api db:init:remote",
+    "deploy:api": "pnpm --filter api run deploy"
+  },
+  "engines": {
+    "node": ">=22"
+  }
+}

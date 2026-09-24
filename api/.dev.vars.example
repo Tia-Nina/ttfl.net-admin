@@ -1,0 +1,7 @@
+# 本地开发密钥（wrangler dev 自动加载；此文件不提交）
+# 生产环境用 `npx wrangler secret put <NAME>` 逐个配置
+
+# openssl rand -hex 32
+JWT_SECRET=dev-only-jwt-secret-change-me
+# 首个 Passkey 注册引导令牌（登录页访问 /?setup=<token>）
+SETUP_TOKEN=dev-setup-token

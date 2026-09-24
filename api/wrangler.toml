@@ -1,0 +1,44 @@
+name = "ttfl-hub"
+main = "src/index.ts"
+compatibility_date = "2026-09-01"
+
+# 一个 Worker，两个自定义域：auth.ttfl.net = 认证中台；api.ttfl.net = 中枢 BFF
+# 注意：API 必须用一级子域 —— Universal SSL 免费证书只覆盖 ttfl.net 和 *.ttfl.net，
+# 二级子域（如 api.admin.ttfl.net）拿不到证书会握手失败。
+# deploy 时 wrangler 会自动创建对应 DNS 记录（需账户有 Zone 权限）
+routes = [
+  { pattern = "auth.ttfl.net", custom_domain = true },
+  { pattern = "api.ttfl.net", custom_domain = true }
+]
+
+[assets]
+directory = "./public"
+binding = "ASSETS"
+# 所有请求先进 Worker：auth 域由 Worker 发静态登录页，api 域不暴露登录页
+run_worker_first = true
+
+[[d1_databases]]
+binding = "DB"
+database_name = "ttfl_hub"
+database_id = "4251d507-913c-4514-9ed9-baab38fd81fd"
+
+[triggers]
+# 每分钟：uptime 探活；每天 03:00 UTC：域名到期检查 + 数据清理
+crons = ["* * * * *", "0 3 * * *"]
+
+[vars]
+# Cookie 作用域：生产 .ttfl.net；本地 dev 用 `wrangler dev --var COOKIE_DOMAIN:localhost` 覆盖
+COOKIE_DOMAIN = ".ttfl.net"
+COOKIE_NAME = "ttfl_session"
+SESSION_TTL_SEC = "604800"
+# 浏览器侧会跳转的固定地址（SDK 与登录页会用到）
+PUBLIC_AUTH_ORIGIN = "https://auth.ttfl.net"
+PUBLIC_HUB_ORIGIN = "https://admin.ttfl.net"
+# Cloudflare 账户 ID（查部署历史 / zones / registrar 用，非机密）
+CF_ACCOUNT_ID = "c6f112f09d6997c59dfe8f2273510b49"
+
+# Secrets（用 wrangler secret put 配置，不要写进本文件）：
+#   JWT_SECRET   —— 中台会话 JWT 签名密钥（openssl rand -hex 32）
+#   SETUP_TOKEN  —— 首个 Passkey 的注册引导令牌（一次性）
+#   GH_TOKEN     —— GitHub PAT（repo + workflow 权限），P2 功能
+#   CF_API_TOKEN —— Cloudflare API Token（Zones/DNS/Workers/D1/Pages 读），P2 功能

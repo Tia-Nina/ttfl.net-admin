@@ -1,0 +1,236 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>ttfl.net · 登录</title>
+<style>
+  :root {
+    --bg: #09090b; --card: #141417; --border: #27272a;
+    --text: #e4e4e7; --muted: #8b8b93; --primary: #7c5cff; --primary-h: #6b4be0;
+    --danger: #ef4444; --ok: #22c55e;
+  }
+  * { box-sizing: border-box; margin: 0; }
+  body {
+    min-height: 100vh; display: flex; align-items: center; justify-content: center;
+    background: radial-gradient(1200px 600px at 20% -10%, #1b1035 0%, var(--bg) 55%);
+    color: var(--text); font-family: system-ui, -apple-system, "Segoe UI", "Microsoft YaHei", sans-serif;
+    padding: 24px;
+  }
+  .card {
+    width: 100%; max-width: 400px; background: var(--card); border: 1px solid var(--border);
+    border-radius: 16px; padding: 36px 32px; box-shadow: 0 20px 60px rgba(0,0,0,.5);
+  }
+  .logo { display: flex; align-items: center; gap: 10px; justify-content: center; margin-bottom: 6px; }
+  .logo .dot { width: 34px; height: 34px; border-radius: 10px; background: linear-gradient(135deg, var(--primary), #b18cff); display: flex; align-items: center; justify-content: center; font-size: 18px; }
+  h1 { font-size: 18px; font-weight: 600; text-align: center; }
+  .sub { color: var(--muted); font-size: 13px; text-align: center; margin: 10px 0 26px; line-height: 1.6; }
+  .field { margin-bottom: 14px; }
+  .field label { display: block; font-size: 12px; color: var(--muted); margin-bottom: 6px; }
+  .field input {
+    width: 100%; background: var(--bg); border: 1px solid var(--border); color: var(--text);
+    border-radius: 10px; padding: 10px 12px; font-size: 14px; outline: none;
+  }
+  .field input:focus { border-color: var(--primary); }
+  button.main {
+    width: 100%; border: none; border-radius: 10px; padding: 12px; margin-top: 6px;
+    background: var(--primary); color: #fff; font-size: 14px; font-weight: 600; cursor: pointer;
+    transition: background .15s; display: flex; align-items: center; justify-content: center; gap: 8px;
+  }
+  button.main:hover:not(:disabled) { background: var(--primary-h); }
+  button.main:disabled { opacity: .55; cursor: wait; }
+  .msg { font-size: 13px; min-height: 18px; margin-top: 14px; text-align: center; }
+  .msg.err { color: var(--danger); }
+  .msg.ok { color: var(--ok); }
+  .tag {
+    display: inline-block; font-size: 11px; color: #fbbf24; border: 1px solid rgba(251,191,36,.35);
+    background: rgba(251,191,36,.08); border-radius: 999px; padding: 3px 10px; margin-bottom: 14px;
+  }
+  .foot { margin-top: 22px; text-align: center; color: var(--muted); font-size: 12px; }
+  .spinner { width: 14px; height: 14px; border: 2px solid rgba(255,255,255,.35); border-top-color: #fff; border-radius: 50%; animation: spin .7s linear infinite; }
+  @keyframes spin { to { transform: rotate(360deg); } }
+</style>
+</head>
+<body>
+  <div class="card">
+    <div class="logo"><div class="dot">◆</div></div>
+    <h1>ttfl.net 控制中枢</h1>
+    <div class="sub" id="subtitle">统一认证中台 · 使用 Passkey 登录</div>
+
+    <div id="setup-tag" style="display:none; text-align:center"><span class="tag">初始化模式：注册管理员 Passkey</span></div>
+
+    <div class="field" id="name-field" style="display:none">
+      <label>管理员显示名</label>
+      <input id="name" placeholder="Tia" maxlength="32" />
+    </div>
+
+    <button class="main" id="go">
+      <span id="go-text">使用 Passkey 登录</span>
+    </button>
+    <div class="msg" id="msg"></div>
+
+    <div class="foot">登录态通过 .ttfl.net 顶级域 Cookie 共享给所有子站点</div>
+  </div>
+
+<script>
+(function () {
+  'use strict'
+  var IS_DEV = location.hostname === 'localhost' || location.hostname === '127.0.0.1'
+  var HUB_ORIGIN = IS_DEV ? 'http://localhost:5173' : 'https://admin.ttfl.net'
+
+  var params = new URLSearchParams(location.search)
+  var redirect = params.get('redirect') || ''
+  var setupToken = params.get('setup') || ''
+
+  var $go = document.getElementById('go')
+  var $msg = document.getElementById('msg')
+  var $subtitle = document.getElementById('subtitle')
+  var goLabel = $go.textContent
+
+  function setMsg(text, cls) { $msg.textContent = text || ''; $msg.className = 'msg' + (cls ? ' ' + cls : '') }
+  function busy(b) {
+    $go.disabled = b
+    $go.innerHTML = b ? '<span class="spinner"></span>' : goLabel
+  }
+
+  // 与登录域名同源即可，无需配置
+  function safeRedirect() {
+    if (redirect) {
+      try {
+        var u = new URL(redirect)
+        var hostOk = u.hostname === 'ttfl.net' || u.hostname.endsWith('.ttfl.net') || (IS_DEV && u.hostname === 'localhost')
+        if (u.protocol === 'https:' && hostOk) return redirect
+      } catch (e) { /* fallthrough */ }
+    }
+    return HUB_ORIGIN + '/'
+  }
+
+  // ---- WebAuthn base64url 工具 ----
+  function b64ToBuf(s) {
+    s = s.replace(/-/g, '+').replace(/_/g, '/')
+    while (s.length % 4) s += '='
+    var bin = atob(s), arr = new Uint8Array(bin.length)
+    for (var i = 0; i < bin.length; i++) arr[i] = bin.charCodeAt(i)
+    return arr.buffer
+  }
+  function bufToB64(buf) {
+    var arr = new Uint8Array(buf), bin = ''
+    for (var i = 0; i < arr.length; i++) bin += String.fromCharCode(arr[i])
+    return btoa(bin).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '')
+  }
+  function post(url, data) {
+    return fetch(url, { method: 'POST', headers: { 'content-type': 'application/json' }, credentials: 'include', body: JSON.stringify(data) })
+      .then(function (r) { return r.json().then(function (j) { return { status: r.status, json: j } }) })
+  }
+
+  function goBack() { location.replace(safeRedirect()) }
+
+  // ---- 注册（初始化 或 已登录追加）----
+  function doRegister() {
+    return post('/api/webauthn/register/options', { setupToken: setupToken, name: document.getElementById('name').value.trim() })
+      .then(function (r) {
+        if (r.status !== 200) throw new Error(r.json.error || '获取注册参数失败')
+        window.__challengeId = r.json.challengeId
+        var o = r.json.options
+        o.excludeCredentials = (o.excludeCredentials || []).map(function (c) { return { type: c.type, id: b64ToBuf(c.id) } })
+        return navigator.credentials.create({
+          publicKey: {
+            challenge: b64ToBuf(o.challenge),
+            rp: o.rp,
+            user: { id: b64ToBuf(o.user.id), name: o.user.name, displayName: o.user.displayName },
+            pubKeyCredParams: o.pubKeyCredParams,
+            timeout: o.timeout,
+            excludeCredentials: o.excludeCredentials,
+            authenticatorSelection: o.authenticatorSelection,
+            attestation: o.attestation,
+          },
+        })
+      })
+      .then(function (cred) {
+        return post('/api/webauthn/register/verify', {
+          challengeId: window.__challengeId, setupToken: setupToken,
+          label: null,
+          response: {
+            id: cred.id, rawId: bufToB64(cred.rawId), type: cred.type,
+            authenticatorAttachment: cred.authenticatorAttachment,
+            clientExtensionResults: cred.getClientExtensionResults(),
+            response: {
+              clientDataJSON: bufToB64(cred.response.clientDataJSON),
+              attestationObject: bufToB64(cred.response.attestationObject),
+              transports: cred.response.getTransports ? cred.response.getTransports() : [],
+            },
+          },
+        })
+      })
+      .then(function (r) {
+        if (r.status !== 200 || !r.json.ok) throw new Error(r.json.error || '注册失败')
+        setMsg('注册成功，正在进入控制台…', 'ok')
+        setTimeout(goBack, 600)
+      })
+  }
+
+  // ---- 登录 ----
+  function doLogin() {
+    return post('/api/webauthn/login/options', {})
+      .then(function (r) {
+        if (r.status !== 200) throw new Error(r.json.error || '获取登录参数失败')
+        window.__challengeId = r.json.challengeId
+        var o = r.json.options
+        return navigator.credentials.get({
+          publicKey: {
+            challenge: b64ToBuf(o.challenge),
+            rpId: o.rpId,
+            timeout: o.timeout,
+            userVerification: o.userVerification,
+            allowCredentials: (o.allowCredentials || []).map(function (c) { return { type: c.type, id: b64ToBuf(c.id) } }),
+          },
+        })
+      })
+      .then(function (assertion) {
+        return post('/api/webauthn/login/verify', {
+          challengeId: window.__challengeId,
+          response: {
+            id: assertion.id, rawId: bufToB64(assertion.rawId), type: assertion.type,
+            clientExtensionResults: assertion.getClientExtensionResults(),
+            response: {
+              clientDataJSON: bufToB64(assertion.response.clientDataJSON),
+              authenticatorData: bufToB64(assertion.response.authenticatorData),
+              signature: bufToB64(assertion.response.signature),
+              userHandle: assertion.response.userHandle ? bufToB64(assertion.response.userHandle) : null,
+            },
+          },
+        })
+      })
+      .then(function (r) {
+        if (r.status !== 200 || !r.json.ok) throw new Error(r.json.error || '登录失败')
+        setMsg('登录成功，正在跳转…', 'ok')
+        setTimeout(goBack, 300)
+      })
+  }
+
+  // ---- 模式与入口 ----
+  if (setupToken) {
+    document.getElementById('setup-tag').style.display = ''
+    document.getElementById('name-field').style.display = ''
+    $subtitle.textContent = '首次部署：为管理员注册第一个 Passkey'
+    goLabel = '注册管理员 Passkey'
+    $go.innerHTML = goLabel
+  }
+
+  // 已登录则直接跳回
+  fetch('/api/session', { credentials: 'include' })
+    .then(function (r) { if (r.ok && !setupToken) { setMsg('已登录，正在跳转…', 'ok'); goBack() } })
+    .catch(function () {})
+
+  $go.addEventListener('click', function () {
+    setMsg('')
+    busy(true)
+    var flow = setupToken ? doRegister() : doLogin()
+    flow.catch(function (e) {
+      setMsg(e.name === 'NotAllowedError' ? '已取消或超时，请重试' : (e.message || '操作失败'), 'err')
+    }).finally(function () { busy(false) })
+  })
+})()
+</script>
+</body>
+</html>
