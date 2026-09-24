@@ -2,6 +2,7 @@ import { Hono } from 'hono'
 import type { AppEnv } from '../types'
 import { all, first, run, now } from '../lib/db'
 import { logEvent } from '../lib/audit'
+import { generateInviteCode } from '../auth/routes'
 
 export const systemApp = new Hono<AppEnv>()
 
@@ -77,6 +78,44 @@ systemApp.delete('/secrets/:id', async (c) => {
   const id = Number(c.req.param('id'))
   await run(c.env.DB, 'delete from secrets_meta where id = ?', id)
   await logEvent(c.env, 'audit', 'secrets_meta.delete', { target: `secret:${id}` })
+  return c.json({ ok: true })
+})
+
+// ---------- 用户注册管理（模式 + 邀请码） ----------
+
+systemApp.get('/registration', async (c) => {
+  const modeRow = await first<{ value: string }>(c.env.DB, "select value from app_state where key = 'registration_mode'")
+  const invites = await all(c.env.DB, 'select * from invite_codes order by created_at desc limit 50')
+  return c.json({
+    mode: modeRow?.value === 'open' ? 'open' : 'invite',
+    invites,
+  })
+})
+
+systemApp.put('/registration', async (c) => {
+  const b = await c.req.json().catch(() => ({}))
+  if (!['open', 'invite'].includes(b.mode)) return c.json({ error: "mode 必须是 'open' 或 'invite'" }, 400)
+  await run(
+    c.env.DB,
+    `insert into app_state (key, value) values ('registration_mode', ?)
+     on conflict(key) do update set value = excluded.value`,
+    b.mode,
+  )
+  await logEvent(c.env, 'audit', 'registration.mode', { actor: c.get('session')?.name, detail: { mode: b.mode } })
+  return c.json({ ok: true })
+})
+
+systemApp.post('/invites', async (c) => {
+  const code = generateInviteCode()
+  await run(c.env.DB, 'insert into invite_codes (code, created_by, created_at) values (?, ?, ?)', code, c.get('session')?.name ?? 'admin', now())
+  await logEvent(c.env, 'audit', 'registration.invite.create', { target: code })
+  return c.json({ code }, 201)
+})
+
+systemApp.delete('/invites/:code', async (c) => {
+  const code = c.req.param('code').toUpperCase()
+  await run(c.env.DB, 'delete from invite_codes where code = ? and used_by is null', code)
+  await logEvent(c.env, 'audit', 'registration.invite.delete', { target: code })
   return c.json({ ok: true })
 })
 

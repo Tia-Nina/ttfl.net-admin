@@ -69,6 +69,29 @@
     </button>
     <div class="msg" id="msg"></div>
 
+    <div class="foot">
+      <a href="javascript:void(0)" id="recover-toggle" style="color:var(--muted)">新设备 / 找回凭证？使用管理员引导码</a>
+    </div>
+    <div id="recover-box" style="display:none; margin-top:12px">
+      <div class="field">
+        <input id="recover-token" placeholder="粘贴管理员引导码（SETUP_TOKEN）" autocomplete="off" />
+      </div>
+      <button class="main" id="recover-go">注册本设备 Passkey</button>
+    </div>
+
+    <div class="foot" style="margin-top:12px">
+      <a href="javascript:void(0)" id="signup-toggle">还没有账号？注册新账号</a>
+    </div>
+    <div id="signup-box" style="display:none; margin-top:12px">
+      <div class="field">
+        <input id="signup-name" placeholder="昵称（展示用）" maxlength="32" autocomplete="off" />
+      </div>
+      <div class="field" id="invite-field" style="display:none">
+        <input id="signup-invite" placeholder="邀请码" maxlength="8" autocomplete="off" style="text-transform:uppercase" />
+      </div>
+      <button class="main" id="signup-go">注册 Passkey 并登录</button>
+    </div>
+
     <div class="foot">登录态通过 .ttfl.net 顶级域 Cookie 共享给所有子站点</div>
   </div>
 
@@ -216,6 +239,88 @@
     goLabel = '注册管理员 Passkey'
     $go.innerHTML = goLabel
   }
+
+  // 管理员引导码自助入口（新设备注册 / 凭证找回）
+  var $recoverBox = document.getElementById('recover-box')
+  document.getElementById('recover-toggle').addEventListener('click', function () {
+    $recoverBox.style.display = $recoverBox.style.display === 'none' ? '' : 'none'
+  })
+  document.getElementById('recover-go').addEventListener('click', function () {
+    var v = document.getElementById('recover-token').value.trim()
+    if (!v) { setMsg('请先粘贴管理员引导码', 'err'); return }
+    setupToken = v
+    goLabel = '注册本设备 Passkey'
+    $go.innerHTML = goLabel
+    setMsg('')
+    $go.click()
+  })
+
+  // ---- 注册新账号（普通用户：开放 / 邀请码制） ----
+  var $signupBox = document.getElementById('signup-box')
+  document.getElementById('signup-toggle').addEventListener('click', function () {
+    var show = $signupBox.style.display === 'none'
+    $signupBox.style.display = show ? '' : 'none'
+    $recoverBox.style.display = 'none'
+  })
+  fetch('/api/webauthn/registration-mode')
+    .then(function (r) { return r.json() })
+    .then(function (j) {
+      if (j.mode === 'invite') document.getElementById('invite-field').style.display = ''
+    })
+    .catch(function () {})
+
+  function doSignup() {
+    var name = document.getElementById('signup-name').value.trim()
+    var invite = document.getElementById('signup-invite').value.trim()
+    if (!name) return Promise.reject(new Error('请填写昵称'))
+    return post('/api/webauthn/signup/options', { name: name, inviteCode: invite })
+      .then(function (r) {
+        if (r.status !== 200) throw new Error(r.json.error || '获取注册参数失败')
+        window.__challengeId = r.json.challengeId
+        var o = r.json.options
+        return navigator.credentials.create({
+          publicKey: {
+            challenge: b64ToBuf(o.challenge),
+            rp: o.rp,
+            user: { id: b64ToBuf(o.user.id), name: o.user.name, displayName: o.user.displayName || o.user.name },
+            pubKeyCredParams: o.pubKeyCredParams,
+            timeout: o.timeout,
+            authenticatorSelection: o.authenticatorSelection,
+            attestation: o.attestation,
+          },
+        })
+      })
+      .then(function (cred) {
+        return post('/api/webauthn/signup/verify', {
+          challengeId: window.__challengeId,
+          name: name,
+          inviteCode: invite,
+          response: {
+            id: cred.id, rawId: bufToB64(cred.rawId), type: cred.type,
+            authenticatorAttachment: cred.authenticatorAttachment,
+            clientExtensionResults: cred.getClientExtensionResults(),
+            response: {
+              clientDataJSON: bufToB64(cred.response.clientDataJSON),
+              attestationObject: bufToB64(cred.response.attestationObject),
+              transports: cred.response.getTransports ? cred.response.getTransports() : [],
+            },
+          },
+        })
+      })
+      .then(function (r) {
+        if (r.status !== 200 || !r.json.ok) throw new Error(r.json.error || '注册失败')
+        setMsg('注册成功，正在进入…', 'ok')
+        setTimeout(goBack, 600)
+      })
+  }
+
+  document.getElementById('signup-go').addEventListener('click', function () {
+    setMsg('')
+    busy(true)
+    doSignup().catch(function (e) {
+      setMsg(e.name === 'NotAllowedError' ? '已取消或超时，请重试' : (e.message || '注册失败'), 'err')
+    }).finally(function () { busy(false) })
+  })
 
   // 已登录则直接跳回
   fetch('/api/session', { credentials: 'include' })

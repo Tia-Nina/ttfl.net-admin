@@ -43,6 +43,28 @@ CREATE TABLE IF NOT EXISTS auth_challenges (
   created_at INTEGER NOT NULL
 );
 
+-- 应用状态（键值）：记录一次性引导码的消费标记等
+CREATE TABLE IF NOT EXISTS app_state (
+  key   TEXT PRIMARY KEY,
+  value TEXT NOT NULL
+);
+
+-- 邀请码（普通用户注册，一码一用）
+CREATE TABLE IF NOT EXISTS invite_codes (
+  code       TEXT PRIMARY KEY,
+  created_by TEXT,
+  created_at INTEGER NOT NULL,
+  used_by    INTEGER,                               -- 使用者 user id（NULL = 未使用；-1 = 占用中）
+  used_at    INTEGER
+);
+
+-- 开放注册的 IP 限速记录
+CREATE TABLE IF NOT EXISTS signup_rl (
+  ip TEXT NOT NULL,
+  ts INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_signup_rl ON signup_rl (ip, ts);
+
 -- ============ 资产台账 ============
 
 CREATE TABLE IF NOT EXISTS assets (

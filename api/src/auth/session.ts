@@ -28,3 +28,12 @@ export const requireAuth: MiddlewareHandler<AppEnv> = async (c, next) => {
   c.set('session', session)
   await next()
 }
+
+/** 管理员门卫：控制台管理功能仅 owner/admin 可用（普通用户会被 403） */
+export const requireHubAdmin: MiddlewareHandler<AppEnv> = async (c, next) => {
+  const session = c.get('session')
+  if (!session || !['owner', 'admin'].includes(session.role)) {
+    return c.json({ error: '需要管理员权限' }, 403)
+  }
+  await next()
+}

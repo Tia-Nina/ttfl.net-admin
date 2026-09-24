@@ -37,13 +37,39 @@ function utf8Bytes(s: string): Uint8Array<ArrayBuffer> {
   return out
 }
 
-async function storeChallenge(env: AppEnv['Bindings'], purpose: 'register' | 'login', challenge: string) {
+async function sha256hex(s: string): Promise<string> {
+  const data = new TextEncoder().encode(s)
+  const buf = await crypto.subtle.digest('SHA-256', data.buffer as ArrayBuffer)
+  return [...new Uint8Array(buf)].map((b) => b.toString(16).padStart(2, '0')).join('')
+}
+
+/** 校验一次性引导码；通过返回 true，无效/已消费返回 false */
+async function checkSetupToken(env: AppEnv['Bindings'], setupToken: string): Promise<string | null> {
+  if (!env.SETUP_TOKEN || setupToken !== env.SETUP_TOKEN) return 'setup token 无效'
+  const consumed = await first<{ value: string }>(env.DB, "select value from app_state where key = 'setup_consumed'")
+  if (consumed?.value === (await sha256hex(setupToken))) {
+    return '该引导码已被使用；请重新 wrangler secret put SETUP_TOKEN 生成新的'
+  }
+  return null
+}
+
+/** 记录引导码已消费（存哈希，不存原值） */
+async function consumeSetupToken(env: AppEnv['Bindings'], setupToken: string) {
+  await run(
+    env.DB,
+    `insert into app_state (key, value) values ('setup_consumed', ?)
+     on conflict(key) do update set value = excluded.value`,
+    await sha256hex(setupToken),
+  )
+}
+
+async function storeChallenge(env: AppEnv['Bindings'], purpose: 'register' | 'login' | 'signup', challenge: string) {
   const id = crypto.randomUUID()
   await run(env.DB, 'insert into auth_challenges (id, challenge, purpose, created_at) values (?, ?, ?, ?)', id, challenge, purpose, now())
   return id
 }
 
-async function takeChallenge(env: AppEnv['Bindings'], id: string, purpose: 'register' | 'login') {
+async function takeChallenge(env: AppEnv['Bindings'], id: string, purpose: 'register' | 'login' | 'signup') {
   const row = await first<{ challenge: string }>(env.DB, 'select challenge from auth_challenges where id = ? and purpose = ?', id, purpose)
   await run(env.DB, 'delete from auth_challenges where id = ?', id)
   return row?.challenge ?? null
@@ -94,23 +120,27 @@ webauthnApp.use('*', hostGate())
 webauthnApp.post('/register/options', async (c) => {
   const env = c.env
   const body = await c.req.json().catch(() => ({}) as Record<string, unknown>)
+  const setupToken = typeof body.setupToken === 'string' ? body.setupToken : ''
 
   const userRows = await all<{ id: number; name: string; role: string }>(env.DB, 'select id, name, role from users')
   const session = await getSession(c)
 
   let user: { id: number; name: string } | null = null
-
-  if (userRows.length === 0) {
-    // 首次初始化：需要一次性 SETUP_TOKEN（wrangler secret put SETUP_TOKEN）
-    if (!env.SETUP_TOKEN) return c.json({ error: '服务端未配置 SETUP_TOKEN，无法初始化' }, 500)
-    if (body.setupToken !== env.SETUP_TOKEN) return c.json({ error: 'setup token 无效' }, 403)
-    user = { id: 0, name: typeof body.name === 'string' && body.name.trim() ? body.name.trim() : 'Tia' }
-  } else {
-    if (!session) return c.json({ error: '请先登录后再添加 Passkey' }, 401)
+  if (session) {
+    // 已登录：为当前用户追加 Passkey
     user = { id: session.sub, name: session.name }
+  } else {
+    // 未登录：一次性引导码（首次初始化 / 凭证全部丢失找回 / 新设备注册）
+    const err = await checkSetupToken(env, setupToken)
+    if (err) return c.json({ error: err }, 403)
+    // 目标账号：已存在的 owner；不存在则创建（首用户）
+    const owner = await first<{ id: number; name: string }>(
+      env.DB,
+      "select id, name from users where role = 'owner' order by id limit 1",
+    )
+    user = owner ?? { id: 0, name: typeof body.name === 'string' && body.name.trim() ? body.name.trim() : 'Tia' }
   }
 
-  // 首次初始化时还没有 user.id，不查已有凭证（注意：D1 不允许 SQL 无占位符却 bind 参数）
   const existing = user.id
     ? await all<{ credential_id: string }>(env.DB, 'select credential_id from credentials where user_id = ?', user.id)
     : []
@@ -139,22 +169,37 @@ webauthnApp.post('/register/verify', async (c) => {
   const expectedChallenge = await takeChallenge(env, body.challengeId, 'register')
   if (!expectedChallenge) return c.json({ error: '注册会话已过期，请重新开始' }, 400)
 
-  const userRows = await all<{ id: number; name: string; role: string }>(env.DB, 'select id, name, role from users')
   const session = await getSession(c)
+  const setupToken = typeof body.setupToken === 'string' ? body.setupToken : ''
 
   let user: { id: number; name: string; role: string }
-  if (userRows.length === 0) {
-    if (!env.SETUP_TOKEN || body.setupToken !== env.SETUP_TOKEN) return c.json({ error: 'setup token 无效' }, 403)
-    const name = typeof body.name === 'string' && body.name.trim() ? body.name.trim() : 'Tia'
-    const res = await env.DB.prepare('insert into users (name, role, created_at, last_login_at) values (?, ?, ?, ?)')
-      .bind(name, 'owner', now(), now())
-      .run()
-    const id = Number((res as { meta?: { last_row_id?: number } }).meta?.last_row_id)
-    await run(env.DB, 'insert into identities (user_id, provider, provider_user_id, label, created_at) values (?, ?, ?, ?, ?)', id, 'passkey', `local:${id}`, 'Passkey', now())
-    user = { id, name, role: 'owner' }
-  } else {
-    if (!session) return c.json({ error: '请先登录' }, 401)
+  let isFirstUser = false
+  let viaSetup = false
+
+  if (session) {
     user = { id: session.sub, name: session.name, role: session.role }
+  } else {
+    const err = await checkSetupToken(env, setupToken)
+    if (err) return c.json({ error: err }, 403)
+    viaSetup = true
+    const owner = await first<{ id: number; name: string; role: string }>(
+      env.DB,
+      "select id, name, role from users where role = 'owner' order by id limit 1",
+    )
+    if (owner) {
+      // 凭证找回 / 新设备注册：挂到已有 owner 账号
+      user = owner
+    } else {
+      // 首次初始化：创建 owner
+      const name = typeof body.name === 'string' && body.name.trim() ? body.name.trim() : 'Tia'
+      const res = await env.DB.prepare('insert into users (name, role, created_at, last_login_at) values (?, ?, ?, ?)')
+        .bind(name, 'owner', now(), now())
+        .run()
+      const id = Number((res as { meta?: { last_row_id?: number } }).meta?.last_row_id)
+      await run(env.DB, 'insert into identities (user_id, provider, provider_user_id, label, created_at) values (?, ?, ?, ?, ?)', id, 'passkey', `local:${id}`, 'Passkey', now())
+      user = { id, name, role: 'owner' }
+      isFirstUser = true
+    }
   }
 
   const verification = await verifyRegistrationResponse({
@@ -178,25 +223,30 @@ webauthnApp.post('/register/verify', async (c) => {
     bytesToBase64(cred.publicKey),
     cred.counter,
     cred.transports?.join(',') ?? null,
-    userRows.length === 0 ? '主 Passkey' : (body.label ?? null),
+    isFirstUser ? '主 Passkey' : (body.label ?? '恢复 Passkey'),
     now(),
   )
 
+  // 引导码一次性：成功注册即消费
+  if (viaSetup) await consumeSetupToken(env, setupToken)
+
   await logEvent(env, 'auth', 'passkey.registered', { actor: user.name, target: `user:${user.id}` })
   const userInfo = await issueSession(c, user)
-  return c.json({ ok: true, user: userInfo, firstLogin: userRows.length === 0 })
+  return c.json({ ok: true, user: userInfo, firstLogin: isFirstUser })
 })
+
+// ---------- 多用户登录：不指定 allowCredentials，由认证器展示可发现的 Passkey ----------
 
 webauthnApp.post('/login/options', async (c) => {
   const env = c.env
   const creds = await all<{ credential_id: string }>(env.DB, 'select credential_id from credentials')
   if (creds.length === 0) {
-    return c.json({ error: '尚未注册任何 Passkey（首次部署请访问 /?setup=<SETUP_TOKEN>）' }, 400)
+    return c.json({ error: '本站还没有任何账号（管理员请用引导码初始化）' }, 400)
   }
+  // 留空 allowCredentials：认证器列出本站全部可发现凭证，用户自选账号
   const options = await generateAuthenticationOptions({
     rpID: rpId(env),
     userVerification: 'preferred',
-    allowCredentials: creds.map((cr) => ({ id: cr.credential_id })),
   })
   const challengeId = await storeChallenge(env, 'login', options.challenge)
   return c.json({ challengeId, options })
@@ -275,6 +325,135 @@ webauthnApp.delete('/credentials/:id', async (c) => {
   await run(c.env.DB, 'delete from credentials where id = ? and user_id = ?', id, session.sub)
   await logEvent(c.env, 'auth', 'passkey.deleted', { actor: session.name, target: `credential:${id}` })
   return c.json({ ok: true })
+})
+
+// ---------- 普通用户注册（开放 / 邀请码制，模式在控制台设置里切换，默认邀请码制） ----------
+
+async function registrationMode(env: AppEnv['Bindings']): Promise<'open' | 'invite'> {
+  const row = await first<{ value: string }>(env.DB, "select value from app_state where key = 'registration_mode'")
+  return row?.value === 'open' ? 'open' : 'invite'
+}
+
+const INVITE_ALPHABET = '23456789ABCDEFGHJKMNPQRSTUVWXYZ'
+
+export function generateInviteCode(): string {
+  let code = ''
+  for (let i = 0; i < 8; i++) code += INVITE_ALPHABET[Math.floor(Math.random() * INVITE_ALPHABET.length)]
+  return code
+}
+
+function validName(n: unknown): string | null {
+  if (typeof n !== 'string') return null
+  const name = n.trim()
+  return name.length >= 1 && name.length <= 32 ? name : null
+}
+
+// 开放注册的 IP 限速：每 IP 每小时 5 次
+async function signupRateLimited(env: AppEnv['Bindings'], ip: string): Promise<boolean> {
+  const since = now() - 3600_000
+  const row = await first<{ n: number }>(env.DB, 'select count(*) as n from signup_rl where ip = ? and ts > ?', ip, since)
+  if ((row?.n ?? 0) >= 5) return true
+  await run(env.DB, 'insert into signup_rl (ip, ts) values (?, ?)', ip, now())
+  return false
+}
+
+webauthnApp.get('/registration-mode', async (c) => {
+  return c.json({ mode: await registrationMode(c.env) })
+})
+
+webauthnApp.post('/signup/options', async (c) => {
+  const env = c.env
+  const body = await c.req.json().catch(() => ({}) as Record<string, unknown>)
+  const name = validName(body.name)
+  if (!name) return c.json({ error: '请填写昵称（1-32 字）' }, 400)
+
+  const mode = await registrationMode(env)
+  if (mode === 'invite') {
+    const code = typeof body.inviteCode === 'string' ? body.inviteCode.trim().toUpperCase() : ''
+    if (!code) return c.json({ error: '本站注册需要邀请码' }, 403)
+    const row = await first<{ code: string }>(env.DB, 'select code from invite_codes where code = ? and used_by is null', code)
+    if (!row) return c.json({ error: '邀请码无效或已被使用' }, 403)
+  } else {
+    const ip = c.req.header('cf-connecting-ip') ?? 'unknown'
+    if (await signupRateLimited(env, ip)) return c.json({ error: '注册过于频繁，请一小时后再试' }, 429)
+  }
+
+  const options = await generateRegistrationOptions({
+    rpName: 'ttfl.net 认证中台',
+    rpID: rpId(env),
+    userID: crypto.getRandomValues(new Uint8Array(16)),
+    userName: name,
+    attestationType: 'none',
+    authenticatorSelection: { userVerification: 'preferred', residentKey: 'preferred' },
+  })
+  const challengeId = await storeChallenge(env, 'signup', options.challenge)
+  return c.json({ challengeId, mode, options })
+})
+
+webauthnApp.post('/signup/verify', async (c) => {
+  const env = c.env
+  const body = (await c.req.json().catch(() => null)) as
+    | { challengeId?: string; name?: string; inviteCode?: string; response?: RegistrationResponseJSON }
+    | null
+  if (!body?.challengeId || !body.response) return c.json({ error: '参数不完整' }, 400)
+  const name = validName(body.name)
+  if (!name) return c.json({ error: '昵称不合法' }, 400)
+
+  const expectedChallenge = await takeChallenge(env, body.challengeId, 'signup')
+  if (!expectedChallenge) return c.json({ error: '注册会话已过期，请重新开始' }, 400)
+
+  // 先完成 WebAuthn 校验，再处理邀请码与建号，避免脏数据
+  const verification = await verifyRegistrationResponse({
+    response: body.response,
+    expectedChallenge,
+    expectedOrigin: expectedOrigin(env),
+    expectedRPID: rpId(env),
+    requireUserVerification: false,
+  })
+  if (!verification.verified || !verification.registrationInfo) {
+    return c.json({ error: '注册校验失败' }, 400)
+  }
+  const cred = extractCredential(verification.registrationInfo as Record<string, unknown>)
+  if (!cred) return c.json({ error: '注册响应缺少凭证信息' }, 400)
+
+  const mode = await registrationMode(env)
+  let inviteCode: string | null = null
+  if (mode === 'invite') {
+    const code = typeof body.inviteCode === 'string' ? body.inviteCode.trim().toUpperCase() : ''
+    if (!code) return c.json({ error: '本站注册需要邀请码' }, 403)
+    // 条件更新原子占用邀请码（并发安全；used_by 先置 -1 占位，建号后回填真实 id）
+    const res = await env.DB.prepare('update invite_codes set used_by = -1, used_at = ? where code = ? and used_by is null')
+      .bind(now(), code)
+      .run()
+    if (((res as { meta?: { changes?: number } }).meta?.changes ?? 0) === 0) {
+      return c.json({ error: '邀请码无效或已被使用' }, 403)
+    }
+    inviteCode = code
+  }
+
+  const res = await env.DB.prepare('insert into users (name, role, created_at) values (?, ?, ?)')
+    .bind(name, 'user', now())
+    .run()
+  const id = Number((res as { meta?: { last_row_id?: number } }).meta?.last_row_id)
+  await run(env.DB, 'insert into identities (user_id, provider, provider_user_id, label, created_at) values (?, ?, ?, ?, ?)', id, 'passkey', `local:${id}`, 'Passkey', now())
+  await run(
+    env.DB,
+    'insert into credentials (user_id, credential_id, public_key, counter, transports, label, created_at) values (?, ?, ?, ?, ?, ?, ?)',
+    id,
+    cred.id,
+    bytesToBase64(cred.publicKey),
+    cred.counter,
+    cred.transports?.join(',') ?? null,
+    '登录 Passkey',
+    now(),
+  )
+  if (inviteCode) {
+    await run(env.DB, 'update invite_codes set used_by = ? where code = ?', id, inviteCode)
+  }
+
+  await logEvent(env, 'auth', 'user.signup', { actor: name, target: `user:${id}`, detail: { mode } })
+  const userInfo = await issueSession(c, { id, name, role: 'user' })
+  return c.json({ ok: true, user: userInfo })
 })
 
 // ---------- 会话（挂载于 /api/session、/api/logout、/api/providers） ----------

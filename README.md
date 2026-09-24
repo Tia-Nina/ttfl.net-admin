@@ -81,8 +81,14 @@ pnpm run deploy                          # wrangler deploy，自动创建两个�
 `CF_ACCOUNT_ID`：Cloudflare 控制台首页右栏复制，填入 `api/wrangler.toml` 的 `[vars]`。
 
 **首个 Passkey**：浏览器访问 `https://auth.ttfl.net/?setup=<SETUP_TOKEN>` → 注册管理员
-Passkey → 自动登录并跳回中枢。丢失全部 Passkey 时重新 `wrangler secret put SETUP_TOKEN`
-即可重走该流程。
+Passkey → 自动登录并跳回控制台。该引导码**一次性**，可用于三类场景：首次初始化、
+凭证全部丢失后的找回、在新设备（如手机）上为本账号注册 Passkey（登录页底部也有
+「管理员引导码」自助入口）。用完或泄露后重新 `wrangler secret put SETUP_TOKEN` 换新。
+
+**普通用户注册**：登录页「注册新账号」，支持两种模式（控制台 → 设置 → 用户注册里切换）：
+- 邀请码制（默认）：在控制台生成邀请码发给用户，一码一用
+- 开放注册：无需邀请码，按 IP 限速（每小时 5 次）
+用户登录后即可在 hrt 等站点使用按账号的云同步。
 
 **中枢前端**：创建 GitHub 仓库（如 `Tia-Nina/ttfl.net-admin`），push 本项目到 main，
 Actions（`deploy-web.yml`）自动把 `web/dist` 发布到 gh-pages 分支；在仓库 Settings →

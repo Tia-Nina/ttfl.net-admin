@@ -1,6 +1,6 @@
 import type { Context, Hono as HonoType, Next } from 'hono'
 import type { AppEnv } from '../types'
-import { requireAuth } from '../auth/session'
+import { requireAuth, requireHubAdmin } from '../auth/session'
 import { hostGate } from '../lib/http'
 import { logEvent } from '../lib/audit'
 import { assetsApp } from './assets'
@@ -35,6 +35,9 @@ export function mountHub(app: HonoType<AppEnv>) {
     app.use(`${prefix}/*`, gate)
     app.use(prefix, requireAuth)
     app.use(`${prefix}/*`, requireAuth)
+    // 控制台管理功能仅 owner/admin（普通用户 403）
+    app.use(prefix, requireHubAdmin)
+    app.use(`${prefix}/*`, requireHubAdmin)
     app.use(prefix, auditWrites)
     app.use(`${prefix}/*`, auditWrites)
   }

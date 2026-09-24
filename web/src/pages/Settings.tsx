@@ -122,6 +122,9 @@ export default function Settings() {
         )}
       </div>
 
+      {/* 注册与邀请码 */}
+      <RegistrationCard />
+
       {/* Passkey 管理 */}
       <div className="bg-base-100 rounded-box border border-base-300 p-5">
         <div className="flex items-center justify-between mb-3">
@@ -240,6 +243,122 @@ export default function Settings() {
           </div>
         )}
       </Modal>
+    </div>
+  )
+}
+
+/** 注册模式与邀请码管理（普通用户通过中台登录页注册） */
+function RegistrationCard() {
+  const { data, reload } = useApiData<{
+    mode: 'open' | 'invite'
+    invites: Array<{ code: string; created_by: string | null; created_at: number; used_by: number | null; used_at: number | null }>
+  }>('/system/registration')
+  const [mode, setMode] = useState<'open' | 'invite' | ''>('')
+  const [busy, setBusy] = useState(false)
+  const [msg, setMsg] = useState<string | null>(null)
+
+  useEffect(() => {
+    if (data && mode === '') setMode(data.mode)
+  }, [data, mode])
+
+  async function saveMode() {
+    if (!mode) return
+    setBusy(true)
+    try {
+      await api('/system/registration', { method: 'PUT', body: { mode } })
+      setMsg(`注册模式已切换为「${mode === 'open' ? '开放注册' : '邀请码制'}」`)
+      await reload()
+    } catch (e) {
+      setMsg((e as Error).message)
+    } finally {
+      setBusy(false)
+    }
+  }
+
+  async function genInvite() {
+    setBusy(true)
+    try {
+      const r = await api<{ code: string }>('/system/invites', { method: 'POST', body: {} })
+      await navigator.clipboard?.writeText(r.code).catch(() => {})
+      setMsg(`新邀请码：${r.code}（已复制到剪贴板）`)
+      await reload()
+    } catch (e) {
+      setMsg((e as Error).message)
+    } finally {
+      setBusy(false)
+    }
+  }
+
+  async function removeInvite(code: string) {
+    try {
+      await api(`/system/invites/${code}`, { method: 'DELETE' })
+      await reload()
+    } catch (e) {
+      alert((e as Error).message)
+    }
+  }
+
+  return (
+    <div className="bg-base-100 rounded-box border border-base-300 p-5">
+      <h2 className="font-semibold mb-2">用户注册</h2>
+      <p className="text-xs opacity-50 mb-3">
+        控制其他站点（如 hrt）的用户如何注册 ttfl.net 账号：邀请码制需在本页生成邀请码发给用户；开放注册按 IP 限速（每小时 5 次）。
+      </p>
+      <ErrorBanner message={msg} />
+      {data && (
+        <>
+          <div className="flex flex-wrap items-center gap-2 mb-4">
+            <select className="select select-bordered select-sm w-40" value={mode} onChange={(e) => setMode(e.target.value as 'open' | 'invite')}>
+              <option value="invite">邀请码制</option>
+              <option value="open">开放注册</option>
+            </select>
+            <button className="btn btn-sm" onClick={saveMode} disabled={busy || mode === data.mode}>
+              保存模式
+            </button>
+            <button className="btn btn-primary btn-sm" onClick={genInvite} disabled={busy}>
+              生成邀请码
+            </button>
+          </div>
+          {data.invites.length === 0 ? (
+            <p className="text-xs opacity-40">还没有邀请码</p>
+          ) : (
+            <div className="overflow-x-auto">
+              <table className="table table-sm">
+                <thead>
+                  <tr>
+                    <th>邀请码</th>
+                    <th>状态</th>
+                    <th>创建</th>
+                    <th />
+                  </tr>
+                </thead>
+                <tbody>
+                  {data.invites.map((i) => (
+                    <tr key={i.code}>
+                      <td className="font-mono text-sm tracking-widest">{i.code}</td>
+                      <td className="text-xs">
+                        {i.used_by ? (
+                          <span className="badge badge-ghost badge-sm">已被用户 #{i.used_by} 使用</span>
+                        ) : (
+                          <span className="badge badge-success badge-sm">可用</span>
+                        )}
+                      </td>
+                      <td className="text-xs opacity-50">{formatTs(i.created_at)}</td>
+                      <td className="text-right">
+                        {!i.used_by && (
+                          <button className="btn btn-ghost btn-xs" onClick={() => removeInvite(i.code)}>
+                            删除
+                          </button>
+                        )}
+                      </td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+          )}
+        </>
+      )}
     </div>
   )
 }
