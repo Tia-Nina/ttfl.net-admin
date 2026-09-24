@@ -70,8 +70,20 @@
     <div class="msg" id="msg"></div>
 
     <div class="foot">
-      <a href="javascript:void(0)" id="recover-toggle" style="color:var(--muted)">新设备 / 找回凭证？使用管理员引导码</a>
+      <a href="javascript:void(0)" id="pw-toggle" style="color:var(--muted)">账号密码登录</a>
+      <span style="opacity:.4"> · </span>
+      <a href="javascript:void(0)" id="recover-toggle" style="color:var(--muted)">管理员引导码</a>
+      <span style="opacity:.4"> · </span>
+      <a href="javascript:void(0)" id="signup-toggle" style="color:var(--muted)">注册新账号</a>
     </div>
+
+    <!-- 账号密码登录 -->
+    <div id="pw-box" style="display:none; margin-top:12px">
+      <div class="field"><input id="pw-email" type="email" placeholder="邮箱" autocomplete="username" /></div>
+      <div class="field"><input id="pw-pass" type="password" placeholder="密码" autocomplete="current-password" /></div>
+      <button class="main" id="pw-go">使用账号密码登录</button>
+    </div>
+
     <div id="recover-box" style="display:none; margin-top:12px">
       <div class="field">
         <input id="recover-token" placeholder="粘贴管理员引导码（SETUP_TOKEN）" autocomplete="off" />
@@ -79,17 +91,31 @@
       <button class="main" id="recover-go">注册本设备 Passkey</button>
     </div>
 
-    <div class="foot" style="margin-top:12px">
-      <a href="javascript:void(0)" id="signup-toggle">还没有账号？注册新账号</a>
-    </div>
+    <!-- 注册新账号 -->
     <div id="signup-box" style="display:none; margin-top:12px">
       <div class="field">
-        <input id="signup-name" placeholder="昵称（展示用）" maxlength="32" autocomplete="off" />
+        <div style="display:flex; gap:14px; font-size:13px; justify-content:center">
+          <label style="cursor:pointer"><input type="radio" name="su-method" value="passkey" checked /> Passkey</label>
+          <label style="cursor:pointer"><input type="radio" name="su-method" value="password" /> 邮箱 + 密码</label>
+        </div>
+      </div>
+      <div class="field"><input id="signup-name" placeholder="昵称（展示用）" maxlength="32" autocomplete="off" /></div>
+      <div id="pw-signup-fields" style="display:none">
+        <div class="field"><input id="signup-email" type="email" placeholder="邮箱" autocomplete="username" /></div>
+        <div class="field"><input id="signup-pass" type="password" placeholder="密码（至少 8 位）" autocomplete="new-password" /></div>
       </div>
       <div class="field" id="invite-field" style="display:none">
         <input id="signup-invite" placeholder="邀请码" maxlength="8" autocomplete="off" style="text-transform:uppercase" />
       </div>
       <button class="main" id="signup-go">注册 Passkey 并登录</button>
+    </div>
+
+    <!-- 密码登录/注册成功后的过渡：引导添加 Passkey -->
+    <div id="after-box" style="display:none; margin-top:12px">
+      <button class="main" id="after-addpasskey">设置 Passkey 快捷登录（推荐）</button>
+      <div class="foot" style="margin-top:10px">
+        <a href="javascript:void(0)" id="after-continue">跳过，直接继续 →</a>
+      </div>
     </div>
 
     <div class="foot">登录态通过 .ttfl.net 顶级域 Cookie 共享给所有子站点</div>
@@ -243,7 +269,9 @@
   // 管理员引导码自助入口（新设备注册 / 凭证找回）
   var $recoverBox = document.getElementById('recover-box')
   document.getElementById('recover-toggle').addEventListener('click', function () {
-    $recoverBox.style.display = $recoverBox.style.display === 'none' ? '' : 'none'
+    var show = $recoverBox.style.display === 'none'
+    hideBoxes()
+    $recoverBox.style.display = show ? '' : 'none'
   })
   document.getElementById('recover-go').addEventListener('click', function () {
     var v = document.getElementById('recover-token').value.trim()
@@ -255,13 +283,29 @@
     $go.click()
   })
 
-  // ---- 注册新账号（普通用户：开放 / 邀请码制） ----
+  // ---- 注册新账号（普通用户：开放 / 邀请码制；凭证方式 Passkey 或 邮箱+密码） ----
   var $signupBox = document.getElementById('signup-box')
+  var $pwBox = document.getElementById('pw-box')
+  var $afterBox = document.getElementById('after-box')
+
+  function hideBoxes() {
+    $recoverBox.style.display = 'none'
+    $pwBox.style.display = 'none'
+    $signupBox.style.display = 'none'
+    $afterBox.style.display = 'none'
+  }
+
   document.getElementById('signup-toggle').addEventListener('click', function () {
     var show = $signupBox.style.display === 'none'
+    hideBoxes()
     $signupBox.style.display = show ? '' : 'none'
-    $recoverBox.style.display = 'none'
   })
+  document.getElementById('pw-toggle').addEventListener('click', function () {
+    var show = $pwBox.style.display === 'none'
+    hideBoxes()
+    $pwBox.style.display = show ? '' : 'none'
+  })
+
   fetch('/api/webauthn/registration-mode')
     .then(function (r) { return r.json() })
     .then(function (j) {
@@ -269,10 +313,85 @@
     })
     .catch(function () {})
 
+  // 注册凭证方式切换
+  var signupMethod = 'passkey'
+  Array.prototype.forEach.call(document.getElementsByName('su-method'), function (radio) {
+    radio.addEventListener('change', function () {
+      signupMethod = radio.value
+      document.getElementById('pw-signup-fields').style.display = signupMethod === 'password' ? '' : 'none'
+      document.getElementById('signup-go').innerHTML = signupMethod === 'password' ? '注册账号并登录' : '注册 Passkey 并登录'
+    })
+  })
+
+  // 密码只在浏览器端做 PBKDF2 派生，服务端只见派生键（详见服务端注释）
+  function bufToHex(arr) {
+    return Array.prototype.map.call(arr, function (b) { return ('0' + b.toString(16)).slice(-2) }).join('')
+  }
+  function derivePassword(password, email) {
+    var enc = new TextEncoder()
+    return crypto.subtle.importKey('raw', enc.encode(password), 'PBKDF2', false, ['deriveBits']).then(function (key) {
+      return crypto.subtle.deriveBits(
+        { name: 'PBKDF2', salt: enc.encode('ttfl:' + email.toLowerCase()), iterations: 150000, hash: 'SHA-256' },
+        key, 256,
+      )
+    }).then(function (bits) { return bufToHex(new Uint8Array(bits)) })
+  }
+
+  function showAfterLogin(json) {
+    hideBoxes()
+    setMsg('')
+    $afterBox.style.display = ''
+    var btn = document.getElementById('after-addpasskey')
+    btn.innerHTML = json.hasPasskey ? '添加 Passkey（可选）' : '设置 Passkey 快捷登录（推荐）'
+  }
+
+  document.getElementById('after-addpasskey').addEventListener('click', function () {
+    setMsg('')
+    busy(true)
+    doRegister().catch(function (e) {
+      setMsg(e.name === 'NotAllowedError' ? '已取消或超时，请重试' : (e.message || '注册失败'), 'err')
+    }).finally(function () { busy(false) })
+  })
+  document.getElementById('after-continue').addEventListener('click', goBack)
+
+  // 账号密码登录
+  document.getElementById('pw-go').addEventListener('click', function () {
+    var email = document.getElementById('pw-email').value.trim()
+    var pw = document.getElementById('pw-pass').value
+    if (!email || !pw) { setMsg('请填写邮箱和密码', 'err'); return }
+    setMsg('')
+    busy(true)
+    derivePassword(pw, email)
+      .then(function (dk) { return post('/api/webauthn/password/login', { email: email, password: dk }) })
+      .then(function (r) {
+        if (r.status !== 200 || !r.json.ok) throw new Error(r.json.error || '登录失败')
+        showAfterLogin(r.json)
+      })
+      .catch(function (e) { setMsg(e.message || '登录失败', 'err') })
+      .finally(function () { busy(false) })
+  })
+
+  function doPasswordSignup() {
+    var name = document.getElementById('signup-name').value.trim()
+    var email = document.getElementById('signup-email').value.trim()
+    var pw = document.getElementById('signup-pass').value
+    var invite = document.getElementById('signup-invite').value.trim()
+    if (!name) return Promise.reject(new Error('请填写昵称'))
+    if (!/^[^\s@]+@[^\s@]+\.[^\s@]{2,}$/.test(email)) return Promise.reject(new Error('邮箱格式不正确'))
+    if (pw.length < 8) return Promise.reject(new Error('密码至少 8 位'))
+    return derivePassword(pw, email)
+      .then(function (dk) { return post('/api/webauthn/password/signup', { name: name, email: email, password: dk, inviteCode: invite }) })
+      .then(function (r) {
+        if (r.status !== 200 || !r.json.ok) throw new Error(r.json.error || '注册失败')
+        showAfterLogin(r.json)
+      })
+  }
+
   function doSignup() {
     var name = document.getElementById('signup-name').value.trim()
     var invite = document.getElementById('signup-invite').value.trim()
     if (!name) return Promise.reject(new Error('请填写昵称'))
+    if (signupMethod === 'password') return doPasswordSignup()
     return post('/api/webauthn/signup/options', { name: name, inviteCode: invite })
       .then(function (r) {
         if (r.status !== 200) throw new Error(r.json.error || '获取注册参数失败')

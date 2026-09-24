@@ -65,6 +65,25 @@ CREATE TABLE IF NOT EXISTS signup_rl (
 );
 CREATE INDEX IF NOT EXISTS idx_signup_rl ON signup_rl (ip, ts);
 
+-- 邮箱+密码登录凭证（密码为客户端 PBKDF2 派生键的服务端哈希，不存明文）
+CREATE TABLE IF NOT EXISTS auth_passwords (
+  user_id        INTEGER PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE,
+  email          TEXT NOT NULL UNIQUE,
+  password_hash  TEXT NOT NULL,                    -- sha256(客户端派生键)
+  email_verified INTEGER NOT NULL DEFAULT 0,       -- 邮件确认功能预留
+  created_at     INTEGER NOT NULL,
+  updated_at     INTEGER NOT NULL
+);
+
+-- 应用级权限（如 home 站管理员）；中台角色 owner/admin 之外细粒度授权用
+CREATE TABLE IF NOT EXISTS app_permissions (
+  user_id    INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  app        TEXT NOT NULL,
+  permission TEXT NOT NULL,
+  created_at INTEGER NOT NULL,
+  PRIMARY KEY (user_id, app, permission)
+);
+
 -- ============ 资产台账 ============
 
 CREATE TABLE IF NOT EXISTS assets (

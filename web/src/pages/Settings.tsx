@@ -125,6 +125,9 @@ export default function Settings() {
       {/* 注册与邀请码 */}
       <RegistrationCard />
 
+      {/* 用户与站点权限 */}
+      <UsersCard />
+
       {/* Passkey 管理 */}
       <div className="bg-base-100 rounded-box border border-base-300 p-5">
         <div className="flex items-center justify-between mb-3">
@@ -358,6 +361,91 @@ function RegistrationCard() {
             </div>
           )}
         </>
+      )}
+    </div>
+  )
+}
+
+/** 用户列表与站点级权限（如 home 管理员） */
+function UsersCard() {
+  const { data, reload } = useApiData<{
+    users: Array<{
+      id: number
+      name: string
+      role: string
+      created_at: number
+      last_login_at: number | null
+      passkeys: number
+      email: string | null
+      home_admin: number
+    }>
+  }>('/system/users')
+  const [busy, setBusy] = useState(false)
+
+  async function toggleHomeAdmin(id: number, grant: boolean) {
+    setBusy(true)
+    try {
+      await api(`/system/users/${id}/permissions`, { method: 'PUT', body: { app: 'home', permission: 'admin', grant } })
+      await reload()
+    } catch (e) {
+      alert((e as Error).message)
+    } finally {
+      setBusy(false)
+    }
+  }
+
+  return (
+    <div className="bg-base-100 rounded-box border border-base-300 p-5">
+      <h2 className="font-semibold mb-2">用户与站点权限</h2>
+      <p className="text-xs opacity-50 mb-3">
+        ttfl.net 账号总览。「Home 管理员」控制能否管理 home 站（导航/博客/独白/更多）；新注册账号默认没有任何管理权限。
+      </p>
+      {data && (
+        <div className="overflow-x-auto">
+          <table className="table table-sm">
+            <thead>
+              <tr>
+                <th>ID</th>
+                <th>昵称</th>
+                <th>角色</th>
+                <th>登录方式</th>
+                <th>最近登录</th>
+                <th>Home 管理员</th>
+              </tr>
+            </thead>
+            <tbody>
+              {data.users.map((u) => (
+                <tr key={u.id}>
+                  <td className="opacity-50">#{u.id}</td>
+                  <td className="font-medium">{u.name}</td>
+                  <td>
+                    <span className={`badge badge-sm ${u.role === 'owner' ? 'badge-primary' : u.role === 'admin' ? 'badge-secondary' : 'badge-ghost'}`}>
+                      {u.role === 'owner' ? '站长' : u.role === 'admin' ? '管理员' : '用户'}
+                    </span>
+                  </td>
+                  <td className="text-xs opacity-70">
+                    {u.passkeys > 0 && <span className="mr-1">🔑×{u.passkeys}</span>}
+                    {u.email && <span>📧</span>}
+                  </td>
+                  <td className="text-xs opacity-50">{formatTs(u.last_login_at)}</td>
+                  <td>
+                    {u.role === 'owner' ? (
+                      <span className="badge badge-xs badge-primary"> inherent</span>
+                    ) : (
+                      <input
+                        type="checkbox"
+                        className="toggle toggle-primary toggle-sm"
+                        disabled={busy}
+                        checked={!!u.home_admin}
+                        onChange={(e) => toggleHomeAdmin(u.id, e.target.checked)}
+                      />
+                    )}
+                  </td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
       )}
     </div>
   )

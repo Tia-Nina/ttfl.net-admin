@@ -119,6 +119,49 @@ systemApp.delete('/invites/:code', async (c) => {
   return c.json({ ok: true })
 })
 
+// ---------- 用户与站点权限管理 ----------
+
+systemApp.get('/users', async (c) => {
+  const users = await all(
+    c.env.DB,
+    `select u.id, u.name, u.role, u.created_at, u.last_login_at,
+            (select count(*) from credentials cr where cr.user_id = u.id) as passkeys,
+            p.email,
+            exists(select 1 from app_permissions ap where ap.user_id = u.id and ap.app = 'home' and ap.permission = 'admin') as home_admin
+     from users u
+     left join auth_passwords p on p.user_id = u.id
+     order by u.id`,
+  )
+  return c.json({ users })
+})
+
+/** 授予/撤销某用户在某应用的 admin 权限（如 home 站管理员） */
+systemApp.put('/users/:id/permissions', async (c) => {
+  const id = Number(c.req.param('id'))
+  const b = await c.req.json().catch(() => ({}))
+  const app = typeof b.app === 'string' ? b.app : ''
+  const grant = !!b.grant
+  if (!/^[a-z0-9_-]{1,32}$/.test(app)) return c.json({ error: 'app 不合法' }, 400)
+  const user = await first<{ id: number; role: string }>(c.env.DB, 'select id, role from users where id = ?', id)
+  if (!user) return c.json({ error: '用户不存在' }, 404)
+
+  if (grant) {
+    await run(
+      c.env.DB,
+      'insert or ignore into app_permissions (user_id, app, permission, created_at) values (?, ?, ?, ?)',
+      id, app, 'admin', now(),
+    )
+  } else {
+    await run(c.env.DB, 'delete from app_permissions where user_id = ? and app = ? and permission = ?', id, app, 'admin')
+  }
+  await logEvent(c.env, 'audit', 'app_permission.update', {
+    actor: c.get('session')?.name,
+    target: `user:${id}`,
+    detail: { app, grant },
+  })
+  return c.json({ ok: true })
+})
+
 // ---------- 域名台账 ----------
 
 systemApp.get('/domains', async (c) => {

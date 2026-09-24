@@ -456,6 +456,118 @@ webauthnApp.post('/signup/verify', async (c) => {
   return c.json({ ok: true, user: userInfo })
 })
 
+// ---------- 邮箱 + 密码注册 / 登录 ----------
+// 密码安全设计：浏览器端先做 PBKDF2-SHA256(150k, salt="ttfl:"+email) 派生出 dk，
+// 只传 dk；服务端存 sha256(dk)。服务端零 KDF 开销（Workers 免费档 CPU 限制友好），
+// 拖库者仍需先攻破客户端 PBKDF2 才能碰撞库。
+
+const EMAIL_RE = /^[^\s@]+@[^\s@]+\.[^\s@]{2,}$/
+
+function normalizeEmail(e: unknown): string | null {
+  if (typeof e !== 'string') return null
+  const email = e.trim().toLowerCase()
+  return EMAIL_RE.test(email) && email.length <= 254 ? email : null
+}
+
+/** 客户端派生键：64 位 hex */
+function validPasswordDK(dk: unknown): string | null {
+  if (typeof dk !== 'string') return null
+  return /^[0-9a-f]{64}$/.test(dk) ? dk : null
+}
+
+/** 常量时间比较，防时序侧信道 */
+function safeEqual(a: string, b: string): boolean {
+  if (a.length !== b.length) return false
+  let diff = 0
+  for (let i = 0; i < a.length; i++) diff |= a.charCodeAt(i) ^ b.charCodeAt(i)
+  return diff === 0
+}
+
+webauthnApp.post('/password/signup', async (c) => {
+  const env = c.env
+  const body = await c.req.json().catch(() => ({}) as Record<string, unknown>)
+  const email = normalizeEmail(body.email)
+  const name = validName(body.name)
+  const dk = validPasswordDK(body.password)
+  if (!email) return c.json({ error: '邮箱格式不正确' }, 400)
+  if (!name) return c.json({ error: '请填写昵称（1-32 字）' }, 400)
+  if (!dk) return c.json({ error: '密码派生键不合法' }, 400)
+
+  // 与 Passkey 注册共用邀请码 / 开放模式与限速
+  const mode = await registrationMode(env)
+  if (mode === 'invite') {
+    const code = typeof body.inviteCode === 'string' ? body.inviteCode.trim().toUpperCase() : ''
+    if (!code) return c.json({ error: '本站注册需要邀请码' }, 403)
+    const row = await first<{ code: string }>(env.DB, 'select code from invite_codes where code = ? and used_by is null', code)
+    if (!row) return c.json({ error: '邀请码无效或已被使用' }, 403)
+  } else {
+    const ip = c.req.header('cf-connecting-ip') ?? 'unknown'
+    if (await signupRateLimited(env, ip)) return c.json({ error: '注册过于频繁，请一小时后再试' }, 429)
+  }
+
+  const exists = await first<{ user_id: number }>(env.DB, 'select user_id from auth_passwords where email = ?', email)
+  if (exists) return c.json({ error: '该邮箱已注册，请直接登录' }, 409)
+
+  const passwordHash = await sha256hex(dk)
+  const nowTs = now()
+  const res = await env.DB.prepare('insert into users (name, role, created_at) values (?, ?, ?)')
+    .bind(name, 'user', nowTs)
+    .run()
+  const id = Number((res as { meta?: { last_row_id?: number } }).meta?.last_row_id)
+  await run(env.DB, 'insert into identities (user_id, provider, provider_user_id, label, created_at) values (?, ?, ?, ?, ?)', id, 'email', email, '邮箱密码', nowTs)
+  await run(
+    env.DB,
+    'insert into auth_passwords (user_id, email, password_hash, email_verified, created_at, updated_at) values (?, ?, ?, 0, ?, ?)',
+    id, email, passwordHash, nowTs, nowTs,
+  )
+  if (mode === 'invite') {
+    const code = (body.inviteCode as string).trim().toUpperCase()
+    await run(env.DB, 'update invite_codes set used_by = ?, used_at = ? where code = ? and used_by is null', id, nowTs, code)
+  }
+
+  await logEvent(env, 'auth', 'password.signup', { actor: name, target: `user:${id}`, detail: { email } })
+  const userInfo = await issueSession(c, { id, name, role: 'user' })
+  return c.json({ ok: true, user: userInfo, hasPasskey: false })
+})
+
+webauthnApp.post('/password/login', async (c) => {
+  const env = c.env
+  const body = await c.req.json().catch(() => ({}) as Record<string, unknown>)
+  const email = normalizeEmail(body.email)
+  const dk = validPasswordDK(body.password)
+  if (!email || !dk) return c.json({ error: '邮箱或密码不正确' }, 401)
+
+  const row = await first<{ user_id: number; password_hash: string }>(
+    env.DB,
+    'select user_id, password_hash from auth_passwords where email = ?',
+    email,
+  )
+  const stored = row?.password_hash ?? ''
+  const computed = await sha256hex(dk)
+  // 统一走比较逻辑，避免「邮箱不存在」与「密码错误」的响应时间差
+  if (!row || !safeEqual(computed, stored)) {
+    await logEvent(env, 'auth', 'password.login.failed', { detail: { email } })
+    return c.json({ error: '邮箱或密码不正确' }, 401)
+  }
+
+  const user = await first<{ id: number; name: string; role: string }>(
+    env.DB,
+    'select id, name, role from users where id = ?',
+    row.user_id,
+  )
+  if (!user) return c.json({ error: '账号不存在' }, 401)
+  // 管理员账号强制 Passkey：不给密码登录口子
+  if (user.role === 'owner' || user.role === 'admin') {
+    return c.json({ error: '管理员账号请使用 Passkey 登录' }, 403)
+  }
+
+  await run(env.DB, 'update users set last_login_at = ? where id = ?', now(), user.id)
+  await logEvent(env, 'auth', 'password.login', { actor: user.name, target: `user:${user.id}` })
+  const hasPasskey = await first<{ n: number }>(env.DB, 'select count(*) as n from credentials where user_id = ?', user.id)
+  const userInfo = await issueSession(c, user)
+  return c.json({ ok: true, user: userInfo, hasPasskey: (hasPasskey?.n ?? 0) > 0 })
+})
+
 // ---------- 会话（挂载于 /api/session、/api/logout、/api/providers） ----------
 
 async function sessionHandler(c: Context<AppEnv>) {
@@ -471,6 +583,20 @@ async function logoutHandler(c: Context<AppEnv>) {
   return c.json({ ok: true })
 }
 
+/** 当前用户在某应用的管理员权限（websiteapi 等后端回查用） */
+async function myPermissionsHandler(c: Context<AppEnv>) {
+  const session = await getSession(c)
+  if (!session) return c.json({ error: '未登录' }, 401)
+  const app = c.req.query('app') ?? ''
+  if (!/^[a-z0-9_-]{1,32}$/.test(app)) return c.json({ error: 'app 不合法' }, 400)
+  const row = await first<{ user_id: number }>(
+    c.env.DB,
+    'select user_id from app_permissions where user_id = ? and app = ? and permission = ?',
+    session.sub, app, 'admin',
+  )
+  return c.json({ app, admin: !!row || session.role === 'owner' || session.role === 'admin' })
+}
+
 /** 挂载认证中台路由 */
 export function mountAuth(app: HonoType<AppEnv>) {
   const gate = hostGate()
@@ -479,7 +605,9 @@ export function mountAuth(app: HonoType<AppEnv>) {
   app.use('/api/session', gate)
   app.use('/api/logout', gate)
   app.use('/api/providers', gate)
+  app.use('/api/my-permissions', gate)
   app.get('/api/session', sessionHandler)
   app.post('/api/logout', logoutHandler)
+  app.get('/api/my-permissions', myPermissionsHandler)
   app.get('/api/providers', (c) => c.json({ providers: Object.keys(OAUTH_PROVIDERS) }))
 }
